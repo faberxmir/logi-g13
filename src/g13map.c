@@ -31,6 +31,11 @@
 #define EXTENDED 0x100
 #define CODE_COUNT 0x200
 #define RECONNECT_MS 2000
+#define MR_BIT 32
+#define NO_TARGET (-1)
+#define STICK_TARGET_BASE KEY_BITS /* record targets: key bits, then stick directions */
+#define RECORD_TIMEOUT_MS 30000
+#define RECORD_PULSE_MS 1000
 
 /* Index is the bit number in the key bitmask. */
 static const wchar_t *const KEY_NAMES[KEY_BITS] = {
@@ -81,6 +86,8 @@ typedef struct {
 
 enum { DIR_UP, DIR_DOWN, DIR_LEFT, DIR_RIGHT, DIR_COUNT };
 
+static const wchar_t *const DIR_NAMES[DIR_COUNT] = {L"up", L"down", L"left", L"right"};
+
 typedef struct {
     Binding keys[KEY_BITS];
     Binding stick[DIR_COUNT];
@@ -90,10 +97,14 @@ typedef struct {
     int analog; /* stick drives a virtual Xbox 360 pad instead of keys */
     int deadzone;
     int show_screen;
+    int has_idle_color;
+    BYTE idle_color[3];
 } Config;
 
 typedef void (*KeySink)(WORD code, int down);
 typedef void (*PadSink)(SHORT x, SHORT y);
+typedef void (*RecordModeHandler)(int on);
+typedef void (*RecordedHandler)(int target, const Binding *binding);
 
 static Config g_cfg;
 static KeySink g_sink;
@@ -101,10 +112,30 @@ static PadSink g_pad_sink;
 static SHORT g_pad_x, g_pad_y;
 static CRITICAL_SECTION g_lock;
 static unsigned long long g_prev_bits;
+static unsigned long long g_pressed_bits; /* keys whose binding is currently held down */
 static int g_dir_active[DIR_COUNT];
 static int g_refs[CODE_COUNT]; /* lets two inputs share a key, e.g. SHIFT */
 
+static int g_record_enabled;
+static int g_recording;
+static int g_record_target = NO_TARGET;
+static WORD g_record_mods[MAX_COMBO - 1];
+static int g_record_mod_count;
+static BYTE g_record_swallow_up[CODE_COUNT]; /* keys whose release must also be hidden */
+static RecordModeHandler g_on_record_mode;
+static RecordedHandler g_on_recorded;
+static ULONGLONG g_record_last_touch;
+static ULONGLONG (WINAPI *g_clock)(void) = GetTickCount64;
+
 /* ---- key output ---- */
+
+static const wchar_t *code_name(WORD code)
+{
+    size_t i;
+    for (i = 0; i < ARRAYSIZE(KEY_CODES); i++)
+        if (KEY_CODES[i].code == code) return KEY_CODES[i].name;
+    return NULL;
+}
 
 static void sink_sendinput(WORD code, int down)
 {
@@ -121,13 +152,8 @@ static void sink_sendinput(WORD code, int down)
 
 static void sink_print(WORD code, int down)
 {
-    size_t i;
-    for (i = 0; i < ARRAYSIZE(KEY_CODES); i++) {
-        if (KEY_CODES[i].code == code) {
-            wprintf(L"%ls %ls\n", down ? L"down" : L"up  ", KEY_CODES[i].name);
-            return;
-        }
-    }
+    const wchar_t *name = code_name(code);
+    if (name) wprintf(L"%ls %ls\n", down ? L"down" : L"up  ", name);
 }
 
 static void sink_send_and_print(WORD code, int down)
@@ -150,6 +176,169 @@ static void binding_release(const Binding *b)
         if (--g_refs[b->codes[i]] == 0) g_sink(b->codes[i], 0);
 }
 
+/* ---- record mode ---- */
+
+/* The keys that can be given a new binding: G1-G22 and the three stick buttons. */
+static int is_recordable_key(int bit)
+{
+    return bit <= 21 || (bit >= 33 && bit <= 35);
+}
+
+static void record_clear_target(void)
+{
+    g_record_target = NO_TARGET;
+    g_record_mod_count = 0;
+}
+
+static void record_touch(void)
+{
+    g_record_last_touch = g_clock();
+}
+
+/* Works out the record mode light: steady dark green, or rolling between dark
+ * and light green while a G13 key is waiting for a keyboard key. */
+static void record_color(ULONGLONG now, int waiting, BYTE *rgb)
+{
+    static const BYTE dark[3] = {0, 60, 0}, light[3] = {140, 255, 140};
+    int i, phase = (int)(now % RECORD_PULSE_MS);
+    int level = waiting ? (phase < RECORD_PULSE_MS / 2 ? phase : RECORD_PULSE_MS - phase) : 0;
+
+    for (i = 0; i < 3; i++)
+        rgb[i] = (BYTE)(dark[i] + (light[i] - dark[i]) * level / (RECORD_PULSE_MS / 2));
+}
+
+/* The caller holds g_lock. */
+static void record_start(void)
+{
+    int i;
+    for (i = 0; i < KEY_BITS; i++) {
+        if (g_pressed_bits >> i & 1) binding_release(&g_cfg.keys[i]);
+    }
+    g_pressed_bits = 0;
+    for (i = 0; i < DIR_COUNT; i++) {
+        if (g_dir_active[i]) binding_release(&g_cfg.stick[i]);
+        g_dir_active[i] = 0;
+    }
+    g_recording = 1;
+    record_clear_target();
+    record_touch();
+    if (g_on_record_mode) g_on_record_mode(1);
+}
+
+/* The caller holds g_lock. */
+static void record_stop(void)
+{
+    int i;
+    if (!g_recording) return;
+    g_recording = 0;
+    record_clear_target();
+    /* A stick still held presses its key on the next report, like a fresh push. */
+    for (i = 0; i < DIR_COUNT; i++) g_dir_active[i] = 0;
+    if (g_on_record_mode) g_on_record_mode(0);
+}
+
+/* Leaves record mode if nothing has been touched for a while. Normal typing
+ * doesn't count, as it isn't aimed at the G13. */
+static void record_check_timeout(void)
+{
+    EnterCriticalSection(&g_lock);
+    if (g_recording && g_clock() - g_record_last_touch >= RECORD_TIMEOUT_MS) record_stop();
+    LeaveCriticalSection(&g_lock);
+}
+
+static int is_modifier(WORD code)
+{
+    return code == 0x1D || code == 0x2A || code == 0x38 || code == 0x36 ||
+           code == (EXTENDED | 0x1D) || code == (EXTENDED | 0x38);
+}
+
+/* Converts a keyboard hook's scan code and extended flag to a KEY_CODES code, or
+ * 0 if it has none. Windows marks the fake left Ctrl sent with AltGr by adding
+ * 0x200 to its scan code, and flags right Shift as extended. Extended keys with
+ * no entry of their own, such as numpad Enter, fall back to the plain key. */
+static WORD hook_code(DWORD scan, int extended)
+{
+    WORD code;
+    if (scan == 0 || scan > 0xFF) return 0;
+    if (scan == 0x36) extended = 0;
+    code = (WORD)(scan | (extended ? EXTENDED : 0));
+    if (code_name(code)) return code;
+    code = (WORD)scan;
+    return code_name(code) ? code : 0;
+}
+
+/* The caller holds g_lock. */
+static void record_commit(WORD key, int *target, Binding *binding)
+{
+    Binding *dest;
+    int i;
+
+    binding->count = 0;
+    for (i = 0; i < g_record_mod_count; i++) binding->codes[binding->count++] = g_record_mods[i];
+    if (key) binding->codes[binding->count++] = key;
+
+    *target = g_record_target;
+    dest = *target >= STICK_TARGET_BASE ? &g_cfg.stick[*target - STICK_TARGET_BASE]
+                                        : &g_cfg.keys[*target];
+    *dest = *binding;
+    record_clear_target();
+}
+
+/* Handles a physical keyboard event in record mode. Returns nonzero if the key
+ * should be hidden from other programs. */
+static int record_key_event(WORD code, int down)
+{
+    int swallow = 0, committed = 0, target = NO_TARGET, i, known = 0;
+    Binding binding;
+
+    binding.count = 0;
+    EnterCriticalSection(&g_lock);
+    if (down) {
+        if (g_record_swallow_up[code]) {
+            swallow = 1; /* auto-repeat of a key that's already been captured */
+        } else if (g_recording && g_record_target != NO_TARGET) {
+            swallow = 1;
+            g_record_swallow_up[code] = 1;
+            record_touch();
+            if (!is_modifier(code)) {
+                record_commit(code, &target, &binding);
+                committed = 1;
+            } else {
+                for (i = 0; i < g_record_mod_count; i++) known |= g_record_mods[i] == code;
+                if (!known && g_record_mod_count < MAX_COMBO - 1)
+                    g_record_mods[g_record_mod_count++] = code;
+            }
+        }
+    } else {
+        swallow = g_record_swallow_up[code];
+        g_record_swallow_up[code] = 0;
+        /* A modifier released with no other key pressed is the binding itself. */
+        if (g_recording && g_record_target != NO_TARGET && g_record_mod_count > 0 &&
+            is_modifier(code)) {
+            record_touch();
+            record_commit(0, &target, &binding);
+            committed = 1;
+        }
+    }
+    LeaveCriticalSection(&g_lock);
+
+    if (committed && g_on_recorded) g_on_recorded(target, &binding);
+    return swallow;
+}
+
+/* Writes a binding as config text, such as "SHIFT+1". */
+static void binding_to_text(const Binding *b, wchar_t *text, size_t count)
+{
+    int i;
+    text[0] = L'\0';
+    for (i = 0; i < b->count; i++) {
+        const wchar_t *name = code_name(b->codes[i]);
+        if (!name) continue;
+        if (i > 0) wcscat_s(text, count, L"+");
+        wcscat_s(text, count, name);
+    }
+}
+
 /* ---- report decoding ---- */
 
 static void update_direction(int dir, int amount)
@@ -158,6 +347,14 @@ static void update_direction(int dir, int amount)
     int active = amount >= threshold;
     if (active == g_dir_active[dir]) return;
     g_dir_active[dir] = active;
+    if (g_recording) {
+        if (active) {
+            record_touch();
+            record_clear_target();
+            g_record_target = STICK_TARGET_BASE + dir;
+        }
+        return;
+    }
     if (active) binding_press(&g_cfg.stick[dir]);
     else binding_release(&g_cfg.stick[dir]);
 }
@@ -208,9 +405,28 @@ static void process_report(const BYTE *r)
     for (bit = 0; bit < 5; bit++) bits |= (unsigned long long)r[3 + bit] << (8 * bit);
     changed = bits ^ g_prev_bits;
     for (bit = 0; bit < KEY_BITS; bit++) {
+        int down = (int)(bits >> bit & 1);
         if (!(changed >> bit & 1)) continue;
-        if (bits >> bit & 1) binding_press(&g_cfg.keys[bit]);
-        else binding_release(&g_cfg.keys[bit]);
+        if (bit == MR_BIT) {
+            if (down && g_record_enabled) {
+                if (g_recording) record_stop();
+                else record_start();
+            }
+        } else if (down) {
+            if (g_recording) {
+                record_touch();
+                if (is_recordable_key(bit)) {
+                    record_clear_target();
+                    g_record_target = bit;
+                }
+            } else {
+                binding_press(&g_cfg.keys[bit]);
+                g_pressed_bits |= 1ULL << bit;
+            }
+        } else if (g_pressed_bits >> bit & 1) {
+            binding_release(&g_cfg.keys[bit]);
+            g_pressed_bits &= ~(1ULL << bit);
+        }
     }
     g_prev_bits = bits;
 
@@ -236,8 +452,10 @@ static void release_all(void)
 {
     int i;
     EnterCriticalSection(&g_lock);
+    record_stop();
     for (i = 0; i < KEY_BITS; i++)
-        if (g_prev_bits >> i & 1) binding_release(&g_cfg.keys[i]);
+        if (g_pressed_bits >> i & 1) binding_release(&g_cfg.keys[i]);
+    g_pressed_bits = 0;
     g_prev_bits = 0;
     for (i = 0; i < DIR_COUNT; i++) {
         if (g_dir_active[i]) binding_release(&g_cfg.stick[i]);
@@ -284,9 +502,22 @@ static int parse_binding(const wchar_t *text, Binding *b, const wchar_t *what)
     return 1;
 }
 
+/* Parses "255,110,0". */
+static int parse_color(const wchar_t *text, BYTE *rgb)
+{
+    int r, g, b;
+    wchar_t extra;
+
+    if (swscanf_s(text, L"%d , %d , %d %lc", &r, &g, &b, &extra, 1) != 3) return 0;
+    if (r < 0 || r > 255 || g < 0 || g > 255 || b < 0 || b > 255) return 0;
+    rgb[0] = (BYTE)r;
+    rgb[1] = (BYTE)g;
+    rgb[2] = (BYTE)b;
+    return 1;
+}
+
 static int load_config(const wchar_t *path, Config *cfg)
 {
-    static const wchar_t *const DIR_NAMES[DIR_COUNT] = {L"up", L"down", L"left", L"right"};
     wchar_t text[128];
     int i;
 
@@ -300,6 +531,7 @@ static int load_config(const wchar_t *path, Config *cfg)
         GetPrivateProfileStringW(L"keys", KEY_NAMES[i], L"", text, ARRAYSIZE(text), path);
         if (!parse_binding(text, &cfg->keys[i], KEY_NAMES[i])) return 0;
     }
+    cfg->keys[MR_BIT].count = 0; /* MR always toggles record mode */
     for (i = 0; i < DIR_COUNT; i++) {
         GetPrivateProfileStringW(L"stick", DIR_NAMES[i], L"", text, ARRAYSIZE(text), path);
         if (!parse_binding(text, &cfg->stick[i], DIR_NAMES[i])) return 0;
@@ -311,6 +543,14 @@ static int load_config(const wchar_t *path, Config *cfg)
     cfg->invert_y = GetPrivateProfileIntW(L"stick", L"invert_y", 0, path);
     cfg->deadzone = GetPrivateProfileIntW(L"stick", L"deadzone", 12, path);
     cfg->show_screen = GetPrivateProfileIntW(L"screen", L"show", 0, path);
+    GetPrivateProfileStringW(L"screen", L"color", L"", text, ARRAYSIZE(text), path);
+    if (text[0]) {
+        if (!parse_color(text, cfg->idle_color)) {
+            fwprintf(stderr, L"Config: color must be red,green,blue from 0-255, not '%ls'\n", text);
+            return 0;
+        }
+        cfg->has_idle_color = 1;
+    }
     if (cfg->release_threshold <= 0 || cfg->release_threshold > cfg->press_threshold) {
         fwprintf(stderr, L"Config: need 0 < release_threshold <= press_threshold\n");
         return 0;
@@ -578,6 +818,202 @@ static void lcd_show(void)
     if (thread) CloseHandle(thread);
 }
 
+/* ---- record mode: light, keyboard hook and saving ---- */
+
+#define FEATURE_BACKLIGHT 7
+#define FEATURE_BUFFER_LEN 258 /* the largest feature report, as the G13 reports it */
+#define LIGHT_STEP_MS 40
+#define SAVE_ERROR_MS 2000
+
+static BYTE g_light_normal[3];
+static int g_light_have_normal;
+static wchar_t g_config_path[MAX_PATH];
+static HANDLE g_hook_stop, g_light_stop;
+static volatile ULONGLONG g_save_error_until;
+
+typedef struct {
+    int target;
+    Binding binding;
+} RecordedJob;
+
+/* Report 7 sets the shared backlight of the keys and the screen. */
+static void light_set(HANDLE device, const BYTE *rgb)
+{
+    BYTE report[5];
+
+    report[0] = FEATURE_BACKLIGHT;
+    report[1] = rgb[0];
+    report[2] = rgb[1];
+    report[3] = rgb[2];
+    report[4] = 0;
+    if (!HidD_SetFeature(device, report, sizeof report))
+        fwprintf(stderr, L"Can't set the backlight, error %lu\n", GetLastError());
+}
+
+/* Remembers the color to go back to. Kept until the G13 disconnects, so a quick
+ * re-entry can never mistake a record mode color for the normal one. */
+static void light_remember_normal(void)
+{
+    BYTE report[FEATURE_BUFFER_LEN];
+    HANDLE device;
+
+    if (g_light_have_normal) return;
+    memset(report, 0, sizeof report);
+    report[0] = FEATURE_BACKLIGHT;
+    device = open_g13(GENERIC_READ | GENERIC_WRITE);
+    if (device == INVALID_HANDLE_VALUE) return;
+    if (HidD_GetFeature(device, report, sizeof report)) {
+        memcpy(g_light_normal, report + 1, 3);
+        g_light_have_normal = 1;
+        wprintf(L"Normal backlight color: %u %u %u\n", report[1], report[2], report[3]);
+    } else {
+        fwprintf(stderr, L"Can't read the backlight color, error %lu\n", GetLastError());
+    }
+    CloseHandle(device);
+}
+
+/* Drives the light for one stay in record mode, then restores the normal color.
+ * It also checks the timeout, as it's the one thing that runs the whole time. */
+static DWORD WINAPI record_light_thread(LPVOID stop_event)
+{
+    static const BYTE save_error[3] = {255, 0, 0};
+    HANDLE stop = (HANDLE)stop_event;
+    HANDLE device = open_g13(GENERIC_READ | GENERIC_WRITE);
+    BYTE shown[3] = {0, 0, 0}, rgb[3];
+    int first = 1;
+
+    while (WaitForSingleObject(stop, first ? 0 : LIGHT_STEP_MS) == WAIT_TIMEOUT) {
+        ULONGLONG now = GetTickCount64();
+
+        if (now < g_save_error_until) memcpy(rgb, save_error, 3);
+        else record_color(now, g_record_target != NO_TARGET, rgb);
+        if (device != INVALID_HANDLE_VALUE && (first || memcmp(rgb, shown, 3) != 0)) {
+            light_set(device, rgb);
+            memcpy(shown, rgb, 3);
+        }
+        first = 0;
+        record_check_timeout();
+    }
+    if (device != INVALID_HANDLE_VALUE) {
+        if (g_light_have_normal) light_set(device, g_light_normal);
+        CloseHandle(device);
+    }
+    CloseHandle(stop);
+    return 0;
+}
+
+static LRESULT CALLBACK record_hook(int code, WPARAM wparam, LPARAM lparam)
+{
+    if (code == HC_ACTION) {
+        const KBDLLHOOKSTRUCT *key = (const KBDLLHOOKSTRUCT *)lparam;
+        if (!(key->flags & LLKHF_INJECTED)) {
+            WORD mapped = hook_code(key->scanCode, (key->flags & LLKHF_EXTENDED) != 0);
+            int down = wparam == WM_KEYDOWN || wparam == WM_SYSKEYDOWN;
+            if (mapped && record_key_event(mapped, down)) return 1;
+        }
+    }
+    return CallNextHookEx(NULL, code, wparam, lparam);
+}
+
+/* The hook exists only while in record mode, on a thread that does nothing else:
+ * Windows drops a keyboard hook that's slow to respond. */
+static DWORD WINAPI record_hook_thread(LPVOID stop_event)
+{
+    HANDLE stop = (HANDLE)stop_event;
+    HHOOK hook = SetWindowsHookExW(WH_KEYBOARD_LL, record_hook, GetModuleHandleW(NULL), 0);
+
+    if (!hook) fwprintf(stderr, L"Can't watch the keyboard, error %lu\n", GetLastError());
+    while (MsgWaitForMultipleObjects(1, &stop, FALSE, INFINITE, QS_ALLINPUT) != WAIT_OBJECT_0) {
+        MSG msg;
+        while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) DispatchMessageW(&msg);
+    }
+    if (hook) UnhookWindowsHookEx(hook);
+    CloseHandle(stop);
+    return 0;
+}
+
+static void on_record_mode(int on)
+{
+    if (on) {
+        HANDLE thread;
+        light_remember_normal();
+        g_hook_stop = CreateEventW(NULL, TRUE, FALSE, NULL);
+        thread = CreateThread(NULL, 0, record_hook_thread, g_hook_stop, 0, NULL);
+        if (thread) CloseHandle(thread);
+        g_light_stop = CreateEventW(NULL, TRUE, FALSE, NULL);
+        thread = CreateThread(NULL, 0, record_light_thread, g_light_stop, 0, NULL);
+        if (thread) CloseHandle(thread);
+    } else {
+        /* Each thread closes its own handle once it has stopped. */
+        if (g_hook_stop) SetEvent(g_hook_stop);
+        if (g_light_stop) SetEvent(g_light_stop);
+        g_hook_stop = NULL;
+        g_light_stop = NULL;
+    }
+    wprintf(L"Record mode %ls.\n", on ? L"on" : L"off");
+    fflush(stdout);
+}
+
+static int record_save(const RecordedJob *job)
+{
+    wchar_t text[128];
+    const wchar_t *section, *name;
+
+    binding_to_text(&job->binding, text, ARRAYSIZE(text));
+    if (job->target >= STICK_TARGET_BASE) {
+        section = L"stick";
+        name = DIR_NAMES[job->target - STICK_TARGET_BASE];
+    } else {
+        section = L"keys";
+        name = KEY_NAMES[job->target];
+    }
+    wprintf(L"Recorded %ls = %ls\n", name, text);
+    fflush(stdout);
+    if (!WritePrivateProfileStringW(section, name, text, g_config_path)) {
+        fwprintf(stderr, L"Can't save to %ls, error %lu\n", g_config_path, GetLastError());
+        return 0;
+    }
+    return 1;
+}
+
+/* Runs on its own thread, because saving would stall the hook. */
+static DWORD WINAPI record_done_thread(LPVOID param)
+{
+    RecordedJob *job = (RecordedJob *)param;
+
+    /* A failed save shows red: it's mapped for now, but won't survive a restart. */
+    if (!record_save(job)) g_save_error_until = GetTickCount64() + SAVE_ERROR_MS;
+    free(job);
+    return 0;
+}
+
+static void on_recorded(int target, const Binding *binding)
+{
+    RecordedJob *job = (RecordedJob *)malloc(sizeof *job);
+    HANDLE thread;
+
+    if (!job) return;
+    job->target = target;
+    job->binding = *binding;
+    thread = CreateThread(NULL, 0, record_done_thread, job, 0, NULL);
+    if (thread) CloseHandle(thread);
+    else free(job);
+}
+
+/* The G13 forgets its color when it loses power, so this runs on every connect. */
+static void light_apply_idle_color(void)
+{
+    HANDLE device;
+
+    if (!g_cfg.has_idle_color) return;
+    memcpy(g_light_normal, g_cfg.idle_color, 3);
+    g_light_have_normal = 1;
+    device = open_g13(GENERIC_READ | GENERIC_WRITE);
+    if (device == INVALID_HANDLE_VALUE) return;
+    light_set(device, g_light_normal);
+    CloseHandle(device);
+}
+
 /* ---- device loop ---- */
 
 #define WM_APP_TRAY (WM_APP + 1)
@@ -621,6 +1057,7 @@ static int device_loop(void)
         wprintf(L"G13 connected.\n");
         fflush(stdout);
         set_connected(1);
+        if (!g_dry_run) light_apply_idle_color();
         if (!g_dry_run && g_cfg.show_screen) lcd_show();
 
         while (ReadFile(device, report, REPORT_LEN, &got, NULL)) {
@@ -631,6 +1068,7 @@ static int device_loop(void)
         }
 
         release_all();
+        g_light_have_normal = 0; /* the G13 resets its color when it loses power */
         if (g_cfg.analog && !g_dry_run) remove_virtual_pad();
         CloseHandle(device);
         wprintf(L"G13 disconnected.\n");
@@ -899,7 +1337,11 @@ int wmain(int argc, wchar_t **argv)
     }
     if (!load_config(config_path, &g_cfg)) return startup_failed(2);
 
+    wcscpy_s(g_config_path, MAX_PATH, config_path);
     InitializeCriticalSection(&g_lock);
+    g_record_enabled = !g_dry_run;
+    g_on_record_mode = on_record_mode;
+    g_on_recorded = on_recorded;
     g_sink = g_dry_run ? sink_print : verbose ? sink_send_and_print : sink_sendinput;
     if (g_cfg.analog) {
         if (g_dry_run) g_pad_sink = pad_sink_print;

@@ -24,5 +24,7 @@ cl /nologo /w /O2 /EHsc /c /DUNICODE /D_UNICODE /I%VIGEM%\include /Fobuild\ViGEm
 cl %FLAGS% /I%VIGEM%\include /Febuild\g13map.exe src\g13map.c build\ViGEmClient.obj %LIBS% || exit /b 1
 rem Same program with no console window, for running in the background.
 cl %FLAGS% /I%VIGEM%\include /Febuild\g13map-bg.exe src\g13map.c build\ViGEmClient.obj %LIBS% /link /SUBSYSTEM:WINDOWS /ENTRY:wmainCRTStartup || exit /b 1
+rem A copy for running build\g13map.exe directly. Bindings recorded there go in
+rem this copy, not the real g13.ini, which keeps experiments separate.
 copy /y g13.ini build\g13.ini >nul
 echo Built build\g13map.exe
